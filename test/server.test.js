@@ -62,3 +62,43 @@ test('неуспешный Telegram не подтверждает заявку',
   const response = await fetch(`${base}/api/leads`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(validLead()) });
   assert.equal(response.status, 502); assert.equal((await response.json()).error, 'Telegram не подтвердил отправку заявки.');
 });
+
+
+test('malformed request target returns 400 and server remains available', async t => {
+  const { base } = await fixture(t, async () => { throw new Error('unexpected'); });
+  const { request } = await import('node:http');
+  const status = await new Promise((resolve, reject) => {
+    const req = request(base, { path: '//[' }, res => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject); req.end();
+  });
+  assert.equal(status, 400);
+  assert.equal((await fetch(`${base}/healthz`)).status, 200);
+});
+
+
+test('concurrent duplicate lead is delivered once', { timeout: 3000 }, async t => {
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const { base, calls } = await fixture(t, async () => {
+    entered(); await gate;
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(validLead()) };
+  const first = fetch(`${base}/api/leads`, options);
+  await started;
+  let second;
+  try { second = await fetch(`${base}/api/leads`, options); }
+  finally { release(); }
+  assert.equal((await first).status, 201);
+  assert.equal(second.status, 409);
+  assert.equal(calls.length, 1);
+});
+
+test('failed delivery releases duplicate reservation for retry', async t => {
+  let attempts = 0;
+  const { base } = await fixture(t, async () => new Response(JSON.stringify({ ok: ++attempts > 1 }), { status: 200 }));
+  const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(validLead()) };
+  assert.equal((await fetch(`${base}/api/leads`, options)).status, 502);
+  assert.equal((await fetch(`${base}/api/leads`, options)).status, 201);
+});

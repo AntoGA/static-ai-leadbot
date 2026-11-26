@@ -104,6 +104,7 @@ export function createApp({ env = process.env, fetchImpl = globalThis.fetch } = 
   const duplicateMs = integer(env.LEAD_DUPLICATE_MINUTES, 10, 1, 1440) * 60000;
   const buckets = new Map();
   const duplicates = new Map();
+  const pendingLeads = new Set();
   let globalAI = { count: 0, end: 0 };
   let activeAI = 0;
 
@@ -130,8 +131,10 @@ export function createApp({ env = process.env, fetchImpl = globalThis.fetch } = 
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    const pathname = new URL(req.url, 'http://localhost').pathname;
     try {
+      let pathname;
+      try { pathname = new URL(req.url, 'http://localhost').pathname; }
+      catch { throw Object.assign(new Error('Некорректный URL.'), { status: 400 }); }
       if (pathname === '/api/chat' || pathname === '/api/leads') {
         const origin = req.headers.origin;
         if (origin && !origins.has(origin)) return json(res, 403, { error: 'Источник запроса не разрешён.' });
@@ -158,7 +161,9 @@ export function createApp({ env = process.env, fetchImpl = globalThis.fetch } = 
           if (!lead) return json(res, 400, { error: 'Проверьте поля формы и согласие.' });
           if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return json(res, 503, { error: 'Приём заявок ещё не настроен.' });
           const fingerprint = createHash('sha256').update(`${ip}\0${lead.name.toLowerCase()}\0${lead.contact.toLowerCase()}\0${lead.comment}`).digest('hex');
-          if ((duplicates.get(fingerprint) || 0) > Date.now()) return json(res, 409, { error: 'Такая заявка уже была отправлена.' });
+          if (pendingLeads.has(fingerprint) || (duplicates.get(fingerprint) || 0) > Date.now()) return json(res, 409, { error: 'Такая заявка уже была отправлена.' });
+          pendingLeads.add(fingerprint);
+          try {
           const id = randomUUID();
           const payload = { chat_id: env.TELEGRAM_CHAT_ID, text: telegramText(lead, clean(env.COMPANY_NAME, 100) || 'Компания', id), disable_web_page_preview: true };
           const thread = integer(env.TELEGRAM_MESSAGE_THREAD_ID, 0, 1, 2147483647);
@@ -179,6 +184,10 @@ export function createApp({ env = process.env, fetchImpl = globalThis.fetch } = 
           if (telegramBody?.ok !== true) return json(res, 502, { error: 'Telegram не подтвердил отправку заявки.' });
           duplicates.set(fingerprint, Date.now() + duplicateMs);
           return json(res, 201, { ok: true, leadId: id });
+          } finally {
+            pendingLeads.delete(fingerprint);
+          }
+
         }
 
         const messages = validateMessages(body?.messages);
